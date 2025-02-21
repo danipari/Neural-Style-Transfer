@@ -4,6 +4,17 @@ import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
 
+class Animation():
+    def __init__(self):
+        self.frames = []
+
+    def append(self, frame):
+        self.frames.append(frame)
+
+    def save(self, path):
+        self.frames[0].save(path, format='GIF', append_images=self.frames[1:], save_all=True, duration=100, loop=0)
+
+
 class VggNet(torch.nn.Module):
     def __init__(self, num_classes=1000, vgg=16):
         """
@@ -90,10 +101,10 @@ def toImageNoScaling(x):
   return Image.fromarray(np.uint8(np.array(x).transpose(1, 2, 0))).convert('RGB')
 
 transform = transforms.Compose([
-    # Transform to tensor without scaling
-    transforms.Lambda(toTensorNoScaling),
     transforms.Resize(256),
     transforms.CenterCrop(256),
+    # Transform to tensor without scaling
+    transforms.Lambda(toTensorNoScaling),
     # Remove mean
     transforms.Lambda(meanSubstraction),
 ])
@@ -105,6 +116,11 @@ transform_inv = transforms.Compose([
     transforms.Lambda(toImageNoScaling),
 ])
 
+# Gram matrix
+def gram_matrix(X):
+  X_vect = X.squeeze(0).reshape(X.shape[1], -1)
+  return torch.matmul(X_vect, X_vect.T)
+
 # From https://web.stanford.edu/~nanbhas/blog/forward-hooks-pytorch/#method-3-attach-a-hook
 # a dict to store the activations
 activation = {}
@@ -114,13 +130,72 @@ def getActivation(name):
         activation[name] = output
     return hook
 
+def get_feature_maps(input, model, layers):
+    # Add hook to layers
+    for layer in layers:
+        n_block = int(layer[5])
+        n_layer = int(layer[7])
+        model.get_submodule(f"block{n_block}")[n_layer-1].register_forward_hook(getActivation(layer))
+
+    # Run forward pass
+    model(input)
+
+    # Retrieve data
+    out = dict()
+    for layer in layers:
+        out[layer] = activation[layer].detach().clone()
+
+    return out
+
 if __name__ == "__main__":
     vgg16 = VggNet()
-    vgg16.load_state_dict(torch.load('model.pth', weights_only=True))
+    vgg16.load_state_dict(torch.load('model.pth'))
 
-    vgg16.block1[0].register_forward_hook(getActivation('conv1_1'))
+    img = transform(Image.open('starry-night.jpg')).unsqueeze(0)
+    style_layers = ['block1_1', 'block2_1', 'block3_1', 'block4_1', 'block5_1']
+    cnt_feature_map = get_feature_maps(img, vgg16, style_layers)
 
-    img = Image.open('starry-night.jpg')
-    vgg16(transform(img))
+    # Test style trasnfer
+    gif = Animation()
+    input = torch.zeros(1, 3, 256, 256, dtype=torch.float32)
+    input.requires_grad = True
+    optimizer = torch.optim.SGD([input], lr=0.001)
+    gif.append(transform_inv(input.detach().squeeze(0)))
 
+    for epoch in range(50):
+
+        optimizer.zero_grad()
+        vgg16(input)
+        loss = 0
+        for layer in style_layers:
+            P_1 = activation[layer]
+            F_1 = cnt_feature_map[layer]
+            _, channels, height, width = cnt_feature_map[layer].shape
+            M = channels
+            N = height*width
+            loss += 1/5 * 1/(4*N**2*M**2)*torch.sum(torch.square(torch.subtract(gram_matrix(P_1), gram_matrix(F_1))))
+        loss.backward()
+        optimizer.step()
+        gif.append(transform_inv(input.detach().squeeze(0)))
+
+    gif.save('style.gif')
+    F_1 = cnt_feature_map['block1_1']
+
+    # Test content trasnfer
+    gif = Animation()
+    input = torch.zeros(3, 256, 256, dtype=torch.float32)
+    input.requires_grad = True
+    optimizer = torch.optim.SGD([input], lr=0.01)
+    gif.append(transform_inv(input.detach()))
+    for epoch in range(15):
+
+        optimizer.zero_grad()
+        vgg16(input)
+        P_1 = activation['block1_1']
+        loss = 0.5*torch.sum(torch.square(torch.subtract(F_1, P_1)))
+        loss.backward()
+        optimizer.step()
+        gif.append(transform_inv(input.detach()))
+
+    gif.save('content.gif')
     print('hola')
