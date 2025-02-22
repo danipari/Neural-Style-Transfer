@@ -85,6 +85,7 @@ class VggNet(torch.nn.Module):
 
         return x
     
+    
 # transpose is use to meet the shape of the tensor C x H x W rather than H x W x C
 mean_pixels = np.float32(np.load('mean_pixels.npy').transpose(2, 0, 1))
 
@@ -92,7 +93,7 @@ def meanSubstraction(x):
     return x - mean_pixels
 
 def meanAddition(x):
-    return x + mean_pixels
+    return torch.clip(x + mean_pixels, min=0, max=255)
 
 def toTensorNoScaling(x):
     return torch.from_numpy(np.array(x).transpose(2, 0, 1))
@@ -118,8 +119,9 @@ transform_inv = transforms.Compose([
 
 # Gram matrix
 def gram_matrix(X):
-  X_vect = X.squeeze(0).reshape(X.shape[1], -1)
-  return torch.matmul(X_vect, X_vect.T)
+  _, num_channels, height, width = X.shape
+  X_vect = X.reshape((num_channels, height*width))
+  return torch.matmul(X_vect, X_vect.T) / (num_channels * height * width)
 
 # From https://web.stanford.edu/~nanbhas/blog/forward-hooks-pytorch/#method-3-attach-a-hook
 # a dict to store the activations
@@ -148,54 +150,57 @@ def get_feature_maps(input, model, layers):
     return out
 
 if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     vgg16 = VggNet()
     vgg16.load_state_dict(torch.load('model.pth'))
+    vgg16.to(device)
+
+    img = transform(Image.open('eiffel-tower.jpg')).unsqueeze(0)
+    img = img.to(device)
+    content_layer = ['block2_4']
+    content_feature_map = get_feature_maps(img, vgg16, content_layer)
 
     img = transform(Image.open('starry-night.jpg')).unsqueeze(0)
+    img = img.to(device)
     style_layers = ['block1_1', 'block2_1', 'block3_1', 'block4_1', 'block5_1']
-    cnt_feature_map = get_feature_maps(img, vgg16, style_layers)
+    style_feature_map = get_feature_maps(img, vgg16, style_layers)
 
     # Test style trasnfer
     gif = Animation()
-    input = torch.zeros(1, 3, 256, 256, dtype=torch.float32)
+    input = 10 * torch.randn_like(img) # torch.zeros(1, 3, 256, 256, dtype=torch.float32)
     input.requires_grad = True
-    optimizer = torch.optim.SGD([input], lr=0.001)
-    gif.append(transform_inv(input.detach().squeeze(0)))
+    optimizer = torch.optim.LBFGS([input])
+    gif.append(transform_inv(input.detach().squeeze(0).cpu()))
 
-    for epoch in range(50):
+    it        = 0
+    prev_loss = 0.
+    loss      = 1e3
+    for _ in range(100): #while abs(loss-prev_loss)>1e-2:
+        it += 1
+        prev_loss = loss
+        def closure():
+            optimizer.zero_grad()
+            # Forward pass
+            input.data = input.data.contiguous()
+            vgg16(input)
 
-        optimizer.zero_grad()
-        vgg16(input)
-        loss = 0
-        for layer in style_layers:
-            P_1 = activation[layer]
-            F_1 = cnt_feature_map[layer]
-            _, channels, height, width = cnt_feature_map[layer].shape
-            M = channels
-            N = height*width
-            loss += 1/5 * 1/(4*N**2*M**2)*torch.sum(torch.square(torch.subtract(gram_matrix(P_1), gram_matrix(F_1))))
-        loss.backward()
-        optimizer.step()
-        gif.append(transform_inv(input.detach().squeeze(0)))
+            # Style loss
+            style_loss = 0
+            for layer in style_layers:
+                style_loss += torch.square(gram_matrix(style_feature_map[layer])-gram_matrix(activation[layer])).mean()
+            
+            # Content loss
+            content_loss = torch.square(content_feature_map[content_layer[0]]-activation[content_layer[0]]).mean()
+            loss = 5e-3 * content_loss + 1 * style_loss
+            loss.backward()
+            return loss
+        
+        gif.append(transform_inv(input.detach().squeeze(0).cpu()))
+        print(f"it {it} - Loss {loss}")
+        loss = optimizer.step(closure)
 
+    print('Saving...')
     gif.save('style.gif')
-    F_1 = cnt_feature_map['block1_1']
 
-    # Test content trasnfer
-    gif = Animation()
-    input = torch.zeros(3, 256, 256, dtype=torch.float32)
-    input.requires_grad = True
-    optimizer = torch.optim.SGD([input], lr=0.01)
-    gif.append(transform_inv(input.detach()))
-    for epoch in range(15):
-
-        optimizer.zero_grad()
-        vgg16(input)
-        P_1 = activation['block1_1']
-        loss = 0.5*torch.sum(torch.square(torch.subtract(F_1, P_1)))
-        loss.backward()
-        optimizer.step()
-        gif.append(transform_inv(input.detach()))
-
-    gif.save('content.gif')
     print('hola')
