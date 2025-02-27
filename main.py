@@ -4,6 +4,9 @@ import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
 
+import server
+server.start_server_in_background()
+
 class Animation():
     def __init__(self):
         self.frames = []
@@ -73,7 +76,7 @@ class VggNet(torch.nn.Module):
             layers.append(nn.ReLU(inplace=True))
             in_channels = out_channels  # the next convolution uses out_channels as input
 
-        layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        layers.append(nn.AvgPool2d(kernel_size=2, stride=2)) # Modification wrt original version
         return nn.Sequential(*layers)
 
     
@@ -99,12 +102,14 @@ class VggNet(torch.nn.Module):
         content_feature_map = {}
         style_feature_map   = {}
         self.activation     = {}
+        hooks               = []
 
         # Attach hook to all layer
         layers = content_layers + style_layers
         for layer in layers:
-            n_block, n_layer = int(layer[5]), int(layer[7])-1
-            self.get_submodule(f"block{n_block}")[n_layer-1].register_forward_hook(self.getActivation(layer))
+            n_block, n_layer = layer[:6], 2*(int(layer[7])-1)
+            hook = self.get_submodule(n_block)[n_layer].register_forward_hook(self.getActivation(layer))
+            hooks.append(hook) 
 
         # Perform forward pass
         self.forward(x)
@@ -116,6 +121,9 @@ class VggNet(torch.nn.Module):
         for layer in style_layers:
             style_feature_map[layer] = self.activation[layer].detach() if detach else self.activation[layer]
 
+        for hook in hooks:
+            hook.remove()
+
         if content_layers and not style_layers:
             return content_feature_map
         elif style_layers and not content_layers:
@@ -125,13 +133,13 @@ class VggNet(torch.nn.Module):
     
     
 # transpose is use to meet the shape of the tensor C x H x W rather than H x W x C
-mean_pixels = np.float32(np.load('mean_pixels.npy').transpose(2, 0, 1))
+mean_pixels = torch.from_numpy(np.float32(np.load('data/mean_pixels.npy').transpose(2, 0, 1)))
 
 def meanSubstraction(x):
-    return x - mean_pixels
+    return x - transforms.Resize(x.shape[1:])(mean_pixels)
 
 def meanAddition(x):
-    return torch.clip(x + mean_pixels, min=0, max=255)
+    return torch.clip(x + transforms.Resize(x.shape[1:])(mean_pixels), min=0, max=255)
 
 def toTensorNoScaling(x):
     return torch.from_numpy(np.array(x).transpose(2, 0, 1))
@@ -140,8 +148,6 @@ def toImageNoScaling(x):
   return Image.fromarray(np.uint8(np.array(x).transpose(1, 2, 0))).convert('RGB')
 
 transform = transforms.Compose([
-    # transforms.Resize(256),
-    # transforms.CenterCrop(256),
     # Transform to tensor without scaling
     transforms.Lambda(toTensorNoScaling),
     # Remove mean
@@ -171,54 +177,59 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     vgg16 = VggNet()
-    vgg16.load_state_dict(torch.load('model.pth'))
+    vgg16.load_state_dict(torch.load('data/model.pth'))
     vgg16.to(device)
 
-    img = transform(Image.open('eiffel-tower.jpg')).unsqueeze(0)
-    img = img.to(device)
-    content_layers=['block2_4']
-    ref_content_feature_map = vgg16.feature_maps(img, content_layers=content_layers, detach=True)
-
-    img = transform(Image.open('starry-night.jpg')).unsqueeze(0)
+    img = transform(Image.open('images/style/starry-night.jpg')).unsqueeze(0)
     img = img.to(device)
     style_layers = ['block1_1', 'block2_1', 'block3_1', 'block4_1', 'block5_1']
     ref_style_feature_map = vgg16.feature_maps(img, style_layers=style_layers, detach=True)
 
+    img = transform(Image.open('images/content/eiffel-tower.jpg')).unsqueeze(0)
+    img = img.to(device)
+    content_layers=['block4_2']
+    ref_content_feature_map = vgg16.feature_maps(img, content_layers=content_layers, detach=True)
+
     # Test style trasnfer
     gif = Animation()
-    input = 10 * torch.randn_like(img) # torch.zeros(1, 3, 256, 256, dtype=torch.float32)
+    input = transform(Image.open('current.jpg')).unsqueeze(0).to(device) # 10 * torch.randn_like(img)
     input.requires_grad = True
-    optimizer = torch.optim.LBFGS([input])
-    gif.append(transform_inv(input.detach().squeeze(0).cpu()))
+    optimizer = torch.optim.Adam([input], lr=1.0) #torch.optim.LBFGS([input])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=300, T_mult=2)
+    current_im = transform_inv(input.detach().squeeze(0).cpu())
+    current_im.save("current.jpg", "JPEG")
 
     style_weight = 1
-    content_weight = 1
+    content_weight = 1e-3
 
     it        = 0
     prev_loss = 0.
     loss      = 1e3
-    for _ in range(100): #while abs(loss-prev_loss)>1e-2:
+    for ii in range(50000): #while abs(loss-prev_loss)>1e-2:
         it += 1
         prev_loss = loss
-        def closure():
-            optimizer.zero_grad()
+        optimizer.zero_grad()
 
-            # Forward pass
-            input.data = input.data.contiguous()
-            content_feature_map, style_feature_map = vgg16.feature_maps(input, content_layers, style_layers)
+        # Forward pass
+        input.data = input.data.contiguous()
+        content_feature_map, style_feature_map = vgg16.feature_maps(input, content_layers, style_layers)
 
-            # Style loss
-            s_loss = [style_weight * style_loss(style_feature_map[layer], ref_style_feature_map[layer]) for layer in style_layers]
-            # Content loss
-            c_loss = [content_weight * content_loss(content_feature_map[layer], ref_content_feature_map[layer]) for layer in content_layers]
+        # Style loss
+        s_loss = [style_weight * style_loss(style_feature_map[layer], ref_style_feature_map[layer]) for layer in style_layers]
+        # Content loss
+        c_loss = [content_weight * content_loss(content_feature_map[layer], ref_content_feature_map[layer]) for layer in content_layers]
 
-            loss = sum(s_loss + c_loss)
-            loss.backward()
-            return loss
+        loss = sum(s_loss + c_loss)
+        loss.backward()
         
-        gif.append(transform_inv(input.detach().squeeze(0).cpu()))
-        print(f"it {it} - Loss {loss}")
-        loss = optimizer.step(closure)
+        optimizer.step()
+        scheduler.step()
+        if ii%10==9:
+            current_im = transform_inv(input.detach().squeeze(0).cpu())
+            current_im.save("current.jpg", "JPEG")
+            print(f"it {it} - Loss {loss}")
+            server.global_state["iteration"] = it
+            server.global_state["loss"]      = loss.item()
 
     print('Saving...')
     gif.save('style.gif')
